@@ -21,11 +21,13 @@ import torch.nn.functional as F
 
 import dnnlib
 import legacy
+from tqdm import tqdm
 
 def project(
     G,
     target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
     *,
+    projection_space           = 'W',
     num_steps                  = 1000,
     w_avg_samples              = 10000,
     initial_learning_rate      = 0.1,
@@ -66,8 +68,24 @@ def project(
     if target_images.shape[2] > 256:
         target_images = F.interpolate(target_images, size=(256, 256), mode='area')
     target_features = vgg16(target_images, resize_images=False, return_lpips=True)
-
-    w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    if projection_space == "W":
+        w_opt = torch.tensor(
+            w_avg,
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True,
+        )  # pylint: disable=not-callable
+    elif projection_space == 'W+':
+        w_opt = torch.tensor(
+            np.tile(w_avg, [1, G.mapping.num_ws, 1]),
+            dtype=torch.float32,
+            device=device,
+            requires_grad=True,
+        )  # pylint: disable=not-callable
+    else:
+        raise ValueError(
+            f"Invalid value for `projection_space`: {projection_space}. Must be one of ['W', 'W+']"
+        )
     w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
 
@@ -76,7 +94,7 @@ def project(
         buf[:] = torch.randn_like(buf)
         buf.requires_grad = True
 
-    for step in range(num_steps):
+    for step in tqdm(range(num_steps)):
         # Learning rate schedule.
         t = step / num_steps
         w_noise_scale = w_std * initial_noise_factor * max(0.0, 1.0 - t / noise_ramp_length) ** 2
@@ -89,7 +107,14 @@ def project(
 
         # Synth images from opt_w.
         w_noise = torch.randn_like(w_opt) * w_noise_scale
-        ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        if projection_space == "W":
+            ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
+        elif projection_space == "W+":
+            ws = w_opt + w_noise
+        else:
+            raise ValueError(
+                f"Invalid value for `projection_space`: {projection_space}. Must be one of ['W', 'W+']"
+            )
         synth_images = G.synthesis(ws, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
@@ -128,7 +153,10 @@ def project(
                 buf -= buf.mean()
                 buf *= buf.square().mean().rsqrt()
 
-    return w_out.repeat([1, G.mapping.num_ws, 1])
+    if projection_space == 'W':
+        return w_out[-1,0].cpu()
+    elif projection_space == 'W+':
+        return w_out[-1].cpu()
 
 #----------------------------------------------------------------------------
 
